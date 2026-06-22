@@ -15,10 +15,16 @@ import (
 	"time"
 )
 
+// waiter represents a waiting GET request
+type waiter struct {
+	ch     chan string
+	served bool // true if a message has been sent to this waiter
+}
+
 // Queue represents a single message queue with FIFO ordering
 type Queue struct {
 	messages []string
-	waiters  []chan string // channels for waiting GET requests (FIFO order)
+	waiters  []*waiter // channels for waiting GET requests (FIFO order)
 	mu       sync.Mutex
 }
 
@@ -51,7 +57,7 @@ func (mb *MessageBroker) getOrCreateQueue(name string) *Queue {
 	}
 	q := &Queue{
 		messages: make([]string, 0),
-		waiters:  make([]chan string, 0),
+		waiters:  make([]*waiter, 0),
 	}
 	mb.queues[name] = q
 	return q
@@ -64,15 +70,10 @@ func (q *Queue) Enqueue(msg string) {
 
 	// if there are waiting receivers, deliver to the first one (FIFO order)
 	if len(q.waiters) > 0 {
-		waiter := q.waiters[0]
+		w := q.waiters[0]
 		q.waiters = q.waiters[1:]
-		select {
-		case waiter <- msg:
-		default:
-			// Receiver timed out, message goes to queue
-			q.messages = append(q.messages, msg)
-		}
-		close(waiter)
+		w.served = true
+		w.ch <- msg // send while holding lock, prevents race with timeout
 		return
 	}
 
@@ -92,36 +93,37 @@ func (q *Queue) Dequeue(timeout time.Duration) (string, bool) {
 		return msg, true
 	}
 
-	// create waiter channel for this request (FIFO ordering)
-	waiter := make(chan string, 1)
-	q.waiters = append(q.waiters, waiter)
+	// create waiter for this request (FIFO ordering)
+	w := &waiter{ch: make(chan string, 1)}
+	q.waiters = append(q.waiters, w)
 	q.mu.Unlock()
 
 	// wait for message with optional timeout
-	var msg string
-	var ok bool
 	if timeout > 0 {
 		select {
-		case msg, ok = <-waiter:
+		case msg := <-w.ch:
+			return msg, true
 		case <-time.After(timeout):
 			q.mu.Lock()
+			defer q.mu.Unlock()
+			// check if we were served while timing out
+			if w.served {
+				msg := <-w.ch
+				return msg, true
+			}
 			// remove from waiters if still there
-			for i, w := range q.waiters {
-				if w == waiter {
+			for i, waiter := range q.waiters {
+				if waiter == w {
 					q.waiters = append(q.waiters[:i], q.waiters[i+1:]...)
-					close(waiter)
 					break
 				}
 			}
-			q.mu.Unlock()
-			<-waiter // consume the close signal
 			return "", false
 		}
-	} else {
-		msg, ok = <-waiter
 	}
 
-	return msg, ok
+	msg := <-w.ch
+	return msg, true
 }
 
 // global broker instance
@@ -132,6 +134,7 @@ func handlePut(w http.ResponseWriter, r *http.Request) {
 	u, err := url.ParseRequestURI(r.URL.String())
 	if err != nil {
 		http.Error(w, "Invalid URI string", http.StatusBadRequest)
+		return
 	}
 
 	if r.Method != http.MethodPut {
@@ -166,6 +169,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	u, err := url.ParseRequestURI(r.URL.String())
 	if err != nil {
 		http.Error(w, "Invalid URI string", http.StatusBadRequest)
+		return
 	}
 
 	if r.Method != http.MethodGet {
