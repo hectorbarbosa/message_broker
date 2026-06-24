@@ -64,7 +64,7 @@ func (mb *MessageBroker) getOrCreateQueue(name string) *Queue {
 }
 
 // enqueue adds a message to the queue, delivering to waiting receiver if available
-func (q *Queue) Enqueue(msg string) {
+func (q *Queue) DeliverOrEnqueue(msg string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -81,8 +81,9 @@ func (q *Queue) Enqueue(msg string) {
 	q.messages = append(q.messages, msg)
 }
 
-// dequeue removes and returns oldest message, blocking until available or timeout
-func (q *Queue) Dequeue(timeout time.Duration) (string, bool) {
+// dequeue removes and returns oldest message, blocking until available,
+// timeout elapses, or ctx is cancelled (e.g. client disconnect).
+func (q *Queue) Dequeue(ctx context.Context, timeout time.Duration) (string, bool) {
 	q.mu.Lock()
 
 	// if message available, return immediately
@@ -98,32 +99,39 @@ func (q *Queue) Dequeue(timeout time.Duration) (string, bool) {
 	q.waiters = append(q.waiters, w)
 	q.mu.Unlock()
 
-	// wait for message with optional timeout
+	// nil channel stays inert in select, so "no timeout" is handled cleanly
+	var timer <-chan time.Time
 	if timeout > 0 {
-		select {
-		case msg := <-w.ch:
-			return msg, true
-		case <-time.After(timeout):
-			q.mu.Lock()
-			defer q.mu.Unlock()
-			// check if we were served while timing out
-			if w.served {
-				msg := <-w.ch
-				return msg, true
-			}
-			// remove from waiters if still there
-			for i, waiter := range q.waiters {
-				if waiter == w {
-					q.waiters = append(q.waiters[:i], q.waiters[i+1:]...)
-					break
-				}
-			}
-			return "", false
-		}
+		timer = time.After(timeout)
 	}
 
-	msg := <-w.ch
-	return msg, true
+	select {
+	case msg := <-w.ch:
+		return msg, true
+	case <-timer:
+		return q.dropWaiter(w)
+	case <-ctx.Done():
+		return q.dropWaiter(w)
+	}
+}
+
+// dropWaiter removes w from the waiters list unless it was already served
+// concurrently by DeliverOrEnqueue. If served, the queued message is returned.
+func (q *Queue) dropWaiter(w *waiter) (string, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if w.served {
+		msg := <-w.ch
+		return msg, true
+	}
+	for i, ww := range q.waiters {
+		if ww == w {
+			q.waiters = append(q.waiters[:i], q.waiters[i+1:]...)
+			break
+		}
+	}
+	return "", false
 }
 
 // global broker instance
@@ -160,7 +168,7 @@ func handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := broker.getOrCreateQueue(queueName)
-	q.Enqueue(msg)
+	q.DeliverOrEnqueue(msg)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -197,7 +205,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := broker.getOrCreateQueue(queueName)
-	msg, ok := q.Dequeue(timeout)
+	msg, ok := q.Dequeue(r.Context(), timeout)
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
